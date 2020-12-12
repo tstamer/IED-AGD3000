@@ -1,0 +1,356 @@
+/* ENGR-2050 SUMMER 2020 - MiniProject
+ * This file has been created for IED Mini Project 3.
+ * */
+
+//#define PRINTTOFILE "MiniProject_out.csv"
+#define RIN 661907092
+
+//__sbit __at 0xB0 SS;        // Sbit on Port 3 pin 0
+#define SS P3_0              // Simulator Sbit on Port 3 pin 0
+#define PB P2_6              // Simulator Sbit on Port 0 pin 0
+
+#include "C8051_SIM.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+void Port_Init(void);               // Initialize all the GPIO ports (I/O only)
+void PCA_Init(void);                // Initialize PCA function
+void XBR_Init(void);                // Initialize Crossbar function
+void Interrupt_Init(void);          // Initialize interrupts function
+void SMB_Init(void);                // Initialize I2C function
+void read_ranger(void);             // Function to read the ranger and start a ping
+void read_compass(void);            // Function to read the compass heading
+void set_servoPW(void);
+void set_motorPW(void);
+void perform_tasks(void);           // Perform different tasks in stages (FSM)
+
+signed int MOTOR_NEUT = 2765;       // Neutral              1.5 ms
+signed int MOTOR_MAX = 3502;        // Full Forward         1.9 ms
+signed int MOTOR_MIN = 2027;        // Full Reverse         1.1 ms
+signed int MOTOR_PW;                // Current PW
+
+signed int SERVO_CENTER = 2765;     // Centered             1.5 ms
+signed int SERVO_RIGHT = 3871;      // All the way right    2.1 ms
+signed int SERVO_LEFT = 1659;       // All the way left     0.9 ms
+signed int SERVO_PW;                // Current PW
+
+unsigned char counts = 0;           // PCA overflow counter
+unsigned char new_range = 0;        // Flag denoting if a new range value should be retrieved (set in interrupt)
+unsigned char new_heading = 0;      // Flag denoting if a new heading value should be retrieved (set in interrupt)
+unsigned char new_print = 0;        // Flag denoting that we can print (set in interrupt)
+unsigned char r_count = 0;          // Counter to count 80 ms for ranger delay
+unsigned char h_count = 0;          // Counter to count 40 ms for compass delay
+unsigned char p_count = 0;          // Counter to count 200 ms for print delay
+
+unsigned int range_f = 0;           // Variable to hold forward ranger distance value (changing "range" variable)
+unsigned int range_l = 0;           // Variable to hold left ranger distance value (we do not need the right ranger for this project)
+unsigned int range_r = 0;           // Variable to hold right ranger distance value
+signed int home_heading = 0;        // Variable to hold the home compass heading value
+signed int magnet_heading = 0;      // Variable to hold the magnet compass heading value
+
+signed int des_heading = 0;         // Desired heading
+signed int heading_error = 0;       // Heading Error calculation
+signed int previous_error = 0;      // Variable for derivative control when turning
+signed int distance_error = 0;      // Error calculation for proportional control
+unsigned int des_range = 50;        // Variable to hold the desired range from the obstacle for various tasks
+unsigned int max_range = 100;       // Max range variable
+unsigned int min_range = 30;        // Min range variable
+
+float ksteer = 7;                   // Proportional Gain constant for steering
+float ksteer_p = 70;                // Proportinal gain for going around obstacle
+float ksteer_d = 50;                // Derivative gain for going around obstacle
+float kdrive = 8;                   // Proportional Gain constant for Drive
+float kdrive_l = 0;                 // Proportional Gain constant for Drive when measuring left range
+float kdrive_r = 0;                 // Proportional Gain constant for Drive when measuring right range
+
+unsigned char state = 1;            // Variable to determine which task the car is currently performing
+char input;                         // Input variable
+unsigned char direction;            // determines direction (0 for left, 1 for right)
+
+
+void main(void){
+
+    Sys_Init();
+    putchar(0);
+    Port_Init();
+    PCA_Init();
+    Interrupt_Init();
+    XBR_Init();
+    SMB_Init();
+
+    // Read ranger once to trigger ping.
+    read_ranger();
+
+    // Initialize the drive motor
+    PCA0CP2 = 65535 - MOTOR_NEUT;
+
+    // Set the motor and servo to neutral for 1 second
+    while(counts < 50){ // Wait 1 second
+        Sim_Update();   // Called in all loops!
+        MOTOR_PW = MOTOR_NEUT;
+        SERVO_PW = SERVO_CENTER;
+    }
+
+    // Clear the flag counter variables to prevent a double read
+    r_count = h_count = p_count = 0;
+    new_range = new_heading = new_print = 0;
+
+    // Print data headers
+    printf("\rHOME_HD,MAGNET_HD,FWD_RANGE,LEFT_RANGE,SERVO_PW,MOTOR_PW\r\n");
+
+    // Make sure pushbutton is not pressed before starting
+    while (!PB) Sim_Update();
+
+    // Run program loop
+    while(1) {
+        Sim_Update(); // MUST BE CALLED IN ALL LOOPS!!! (used to update the simulation and this code)
+        perform_tasks(); // Perform tasks in a specified order
+        if (new_print){
+            // Print import stuff (every 0.2 seconds)
+            new_print = 0;
+            printf("%u\t%u\t%u\t%u\r\n", range_f, range_l, range_r, state);
+        }
+
+    }
+}
+
+void Port_Init(void) {
+    // Port 1
+    P1MDOUT |= 0x0D; // Make P1.0,.2,.3 outputs
+    // Port 2
+    P2MDOUT &= ~0x40; // Pushbutton configuration
+    P2 |= 0x40;
+    // Port 3
+    P3MDOUT &= ~0x01; // Slide switch configuration
+    P3 |= 0x01;
+}
+
+void XBR_Init(void) {
+    XBR0 = 0x27;    // 00100111, Enable SPI, I2C, and CEX0-3
+}
+
+void PCA_Init(void) {
+    PCA0MD |= 0x01; // SYSCLK/12, Interrupt Enable
+    PCA0CPM0 |= 0xC2; // Enable 16-bit PWM, compare function
+    PCA0CPM2 |= 0xC2;
+    PCA0CPM3 |= 0xC2;
+    CR = 1; // Same as PCA0CN |= 0x40;
+}
+
+void Interrupt_Init(void) {
+    EIE1 |= 0x08;       // Enable PCA interrupt
+    EA = 1;             // Globally Enable interrupts
+}
+
+void SMB_Init(void) {
+    SMB0CR = 0x93;      // Configure the I2C Clock Rate
+    ENSMB=1;            // Enable the module
+}
+
+void read_compass(void) {
+    unsigned char Data[2];               // Data is an array with a length of 2
+
+    //Home Compass
+    i2c_read_data(0xC0, 2, Data, 2);                        // read two byte, starting at reg 2
+    home_heading =(((unsigned int)Data[0] << 8) | Data[1]);      // combine the two values
+                            //heading has units of 1/10 of a degree
+    //Magnet Compass
+    i2c_read_data(0xC2, 2, Data, 2);                        // read two byte, starting at reg 2
+    magnet_heading =(((unsigned int)Data[0] << 8) | Data[1]);      // combine the two values
+                            //heading has units of 1/10 of a degree
+}
+
+void read_ranger(void) {
+    unsigned char Data[2];               // Data is an array with length of 2
+    
+    // Forward Ranger Read/Write
+    i2c_read_data(0xE0, 2, Data, 2);     // read two bytes from 0xEO (forward ranger address), starting at reg 2
+    range_f = (((unsigned int)Data[0] << 8) | Data[1]);       // combine the two values
+    Data[0] = 0x51 ;                     // Tell the ranger to trigger a ping ---> write 0x51 to reg 0 (ping in cm)
+    i2c_write_data(0xE0, 0, Data, 1);    // write data byte to ranger
+
+    // Left Ranger Read/Write
+    i2c_read_data(0xE4, 2, Data, 2);     // read two bytes from 0xE4 (left ranger address), starting at reg 2
+    range_l = (((unsigned int)Data[0] << 8) | Data[1]);       // combine the two values
+    Data[0] = 0x51 ;                     // Tell the ranger to trigger a ping ---> write 0x51 to reg 0 (ping in cm)
+    i2c_write_data(0xE4, 0, Data, 1);    // write data byte to ranger
+
+    // Left Ranger Read/Write
+    i2c_read_data(0xE6, 2, Data, 2);     // read two bytes from 0xE4 (left ranger address), starting at reg 2
+    range_r = (((unsigned int)Data[0] << 8) | Data[1]);       // combine the two values
+    Data[0] = 0x51 ;                     // Tell the ranger to trigger a ping ---> write 0x51 to reg 0 (ping in cm)
+    i2c_write_data(0xE6, 0, Data, 1);    // write data byte to ranger
+}
+
+
+
+void PCA_ISR(void) {
+    if(CF) {     // If a PCA overflow has occurred
+        PCA0 = 28672;   // Preload the counter for 20 ms operation
+        
+        // Increment *all* our counters
+        counts++;
+        r_count++;
+        h_count++;
+        p_count++;
+        
+        // Add flag settings for each delayed action
+        if(r_count >= 4){
+            new_range = 1;
+            r_count = 0;
+        }
+
+        if (h_count >= 2) {
+            new_heading = 1;
+            h_count = 0;
+        }
+
+        if (p_count >= 10) {
+            new_print = 1;
+            p_count = 0;
+        }
+    }
+    PCA0CN = 0x40;      // Clear all interrupts (including CF), leave CR=1
+}
+
+void set_servoPW() {
+    // Determine heading error for P-D control
+    heading_error = (magnet_heading + 3600 - des_heading) % 3600;
+    if (state == 6) { // change to home heading when driving home
+        heading_error = (home_heading + 3600 - des_heading) % 3600;
+    } 
+
+    // Adjust Servo using P-D Control
+    if (heading_error >= 1800) {    // When the error is too far, correct to the right                             
+        SERVO_PW = SERVO_CENTER + ksteer * (3600 - heading_error);
+    }
+    else {                          // Otherwise, keep turning left
+        SERVO_PW = SERVO_CENTER - ksteer * (heading_error);
+    }
+
+    // Perform Specified Task
+    if (state == 3) { 
+        if (magnet_heading < 1800) 
+            SERVO_PW = SERVO_CENTER + (magnet_heading-1800)*(1106.0/1800.0);
+        else if (magnet_heading == 1800) 
+            SERVO_PW = SERVO_CENTER;
+        else 
+            SERVO_PW = SERVO_CENTER + 1106 - (magnet_heading-1800)*(1106.0/1800.0);
+    } 
+    else if (state == 4) {
+        if (range_f < 40) // swerve right
+            SERVO_PW = SERVO_RIGHT;
+        if (range_l < 40) // go forward if obstacle is towards left
+            SERVO_PW = SERVO_CENTER;    
+    }
+    else if (state == 5 && direction == 0) {
+        previous_error = distance_error;
+        distance_error = range_l - des_range;
+
+        if (range_l < 2 * des_range)    // only if magnet can even be seen
+            SERVO_PW -= ksteer_p * distance_error - ksteer_d * (previous_error - distance_error);
+    }
+    else if (state == 5 && direction == 1) {
+        previous_error = distance_error;
+        distance_error = range_r - des_range;
+
+        if (range_r < 2 * des_range)    // only if magnet can even be seen
+            SERVO_PW += ksteer_p * distance_error - ksteer_d * (previous_error - distance_error);
+    }
+
+    if (state == 6) {
+        printf("Test\r\n");
+        if (range_f < 40) // swerve right
+            SERVO_PW = SERVO_RIGHT;
+        if (range_l < 40 || range_r < 40) // go forward if obstacle is towards left
+            SERVO_PW = SERVO_CENTER; 
+    }
+
+    // Set the turn limits for the servo
+    if (SERVO_PW > SERVO_RIGHT) { // Set the left limit
+        SERVO_PW = SERVO_RIGHT;
+    }
+    else if (SERVO_PW < SERVO_LEFT) { // Set the right limit
+        SERVO_PW = SERVO_LEFT;
+    }
+
+
+    PCA0CP0 = 0xFFFF - SERVO_PW; // Send the data to the servo
+}
+
+void set_motorPW() {
+    // Perform Specified Task
+    if (state == 3) { // Adjust motor speed based on the distance from the magnet
+        MOTOR_PW = MOTOR_NEUT + (range_f-des_range)*(737/500)*kdrive;
+    } else if (state >= 4) { // Engage the motor to maximum for the rest of the tasks
+        MOTOR_PW = MOTOR_MAX;
+    }
+
+    // Set the speed limits for the motor
+    if (MOTOR_PW < MOTOR_NEUT+50 && MOTOR_PW > MOTOR_NEUT-50) { // Prevent 'jiggling' when the motor is in a near-neutral state.
+        MOTOR_PW = MOTOR_NEUT;
+    } else if (MOTOR_PW > MOTOR_MAX) { // Set the forward limit
+        MOTOR_PW = MOTOR_MAX;
+    } else if (MOTOR_PW < MOTOR_MIN) { // Set the reverse limit
+        MOTOR_PW = MOTOR_MIN;
+    }
+
+    PCA0CP2 = 0xFFFF - MOTOR_PW; // Send the data to the motor
+}
+
+/*
+Task 1: Toggle Switch --> Start Program
+Task 2: Approach Magnet, then Stop
+Task 3: Turn Right
+Task 4: Orbit the Magnet
+Task 5: Drive Home
+*/
+void perform_tasks(void) {
+    // Override Normal Task Order
+    //if (!PB) state = 5; // Go home whenever the pushbutton is pressed.
+
+    // Normal Task Order
+    if (state == 1) {
+        printf("\rNow in manual mode.\r\n");
+        input = getchar();
+        while (input != 'c') {
+            Sim_Update();
+            input = getchar();
+            // Wait for key to be pressed
+            /*if (input != 'w' && input != 's') {
+                printf("In loop 1.\r\n");
+                // move full forward
+                MOTOR_PW = MOTOR_NEUT;
+            }*/
+            if (input == 's') {
+                printf("In loop 2.\r\n");
+                // move full backwards
+                MOTOR_PW = MOTOR_MIN;
+            }
+            else if (input == 'w') {
+                MOTOR_PW = MOTOR_MAX;
+            }
+            PCA0CP2 = 0xFFFF - MOTOR_PW; // Send the data to the motor
+            if (input == 'a') {
+                // turn full left
+                SERVO_PW = SERVO_LEFT;
+            }
+            else if (input == 'd') {
+                // turn full right
+                SERVO_PW = SERVO_RIGHT;
+            }
+            else if (input != 'a' && input != 'd') {
+                SERVO_PW = SERVO_CENTER;
+            }
+            PCA0CP0 = 0xFFFF - SERVO_PW; // Send the data to the servo
+            input = ' ';
+        }
+    }
+}
+
+/*
+1. ask for going around left or right and for specified range
+2. wait for SS to be switched to start moving car
+3. go to purple magnet and circle around specified range (simulating mvoing down driveway)
+4. when button is pressed go home (simulating going to station/garbage pickup location)
+*/
