@@ -1,0 +1,158 @@
+#include "IRremote.h"
+#include <Servo.h>
+
+#define IR_RX_PIN  12
+#define SERVO_PIN  3
+#define ULTRA_SONIDO_SIG 13
+
+#define MOTOR_1_EN 5
+#define MOTOR_1_IN1 7
+#define MOTOR_1_IN2 4
+
+#define MOTOR_2_EN 6
+#define MOTOR_2_IN3 9
+#define MOTOR_2_IN4 8
+
+#define BACKWARD 0
+#define FORWARD 1
+#define BREAK 2
+
+// global values
+Servo servoMotor;
+IRrecv irrecv(IR_RX_PIN);
+decode_results results;
+int state = 0;
+
+void blink()
+{
+  state = !state;
+}
+
+void setup()
+{
+  //serial port is intialized
+  Serial.begin(9600);
+ 
+  //IR is intializaed
+  irrecv.enableIRIn(); // start receiver
+  irrecv.blink13(true);
+ 
+  //associated pin
+  servoMotor.attach(SERVO_PIN);
+
+  //motor pins are initialized
+  pinMode(MOTOR_1_EN,OUTPUT);    
+  pinMode(MOTOR_1_IN1,OUTPUT);
+  pinMode(MOTOR_1_IN2,OUTPUT);
+  pinMode(MOTOR_2_EN,OUTPUT);    
+  pinMode(MOTOR_2_IN3,OUTPUT);
+  pinMode(MOTOR_2_IN4,OUTPUT);
+ 
+}
+
+void loop()
+{
+ 
+  //info from sensor
+  float cmMsec;
+  long microsec;
+
+  servoMotor.write(0); //move to 0º position
+  motorTest(255 ,FORWARD);
+  delay(1000);
+  servoMotor.write(90); //move to 0º position
+  motorTest(255 ,FORWARD);
+  delay(1000);
+  servoMotor.write(180); //move to 0º position
+  motorTest(255 ,BACKWARD);
+  delay(1000);
+ 
+  if (irrecv.decode(&results))
+  {
+    if (results.decode_type == NEC && results.value == 0xfd50af)
+    {
+        Serial.println("-UP");
+        servoMotor.write(0); //move to 0º position
+        
+        //calculating distance
+        microsec = timing(ULTRA_SONIDO_SIG);  
+        cmMsec = microsecondsToCentimeters(microsec);
+      Serial.println("Distance:");
+      Serial.println(cmMsec);
+      Serial.println("\n");
+      motorTest(100 ,FORWARD);
+      
+    }
+    else if (results.decode_type == NEC && results.value == 0xfd10ef)
+    {
+      Serial.println("-DOWN");
+     servoMotor.write(90); //move to 0º position
+      motorTest(150 ,BACKWARD);
+    }
+    irrecv.resume(); //ready to receive new data
+  }
+}
+
+long microsecondsToCentimeters(long microseconds)
+{
+
+  return ((microseconds / 29) / 2);
+}
+
+float timing(int pingPin)
+{
+
+  pinMode(pingPin, OUTPUT);
+  digitalWrite(pingPin, LOW);
+  delayMicroseconds(3);
+  digitalWrite(pingPin, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(pingPin, LOW);
+ 
+
+  pinMode(pingPin, INPUT);
+  return pulseIn(pingPin, HIGH);
+}
+
+void motorTest(int speed,int direction)
+{
+  if(direction == BACKWARD)
+  {
+    digitalWrite(MOTOR_1_IN1,HIGH) ;
+    digitalWrite(MOTOR_1_IN2,LOW) ;
+    analogWrite(MOTOR_1_EN,speed) ;
+
+    digitalWrite(MOTOR_2_IN3,LOW) ;
+    digitalWrite(MOTOR_2_IN4,HIGH) ;
+    analogWrite(MOTOR_2_EN,speed) ;
+    {
+      Serial.println("Backward");
+    }
+  }
+  else if(direction == FORWARD)
+  {
+    digitalWrite(MOTOR_1_IN2,HIGH) ;
+    digitalWrite(MOTOR_1_IN1,LOW) ;
+    analogWrite(MOTOR_1_EN,speed) ;
+
+    digitalWrite(MOTOR_2_IN4,LOW) ;
+    digitalWrite(MOTOR_2_IN3,HIGH) ;
+    analogWrite(MOTOR_2_EN,speed) ;
+    {
+      Serial.println("Foward");
+    }
+  }   
+  else //BRAKE
+  {
+    digitalWrite(MOTOR_1_IN2,HIGH) ;
+    digitalWrite(MOTOR_1_IN1,HIGH) ;
+    analogWrite(MOTOR_1_EN,0) ;
+
+    digitalWrite(MOTOR_2_IN4,HIGH) ;
+    digitalWrite(MOTOR_2_IN3,HIGH) ;
+    analogWrite(MOTOR_2_EN,0) ;
+    {
+      Serial.println("Brake");
+    }
+  }
+}
